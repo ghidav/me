@@ -1,0 +1,132 @@
+---
+title: "Why and how to achieve longer context windows for LLMs"
+date: "2023-10-13"
+section: "Education"
+description: "From absolute positional encodings through RoPE to PI, NTK-aware, NTK-by-parts, Dynamic NTK, and YaRN — a tour of the techniques that stretch an LLM's context window past its training length."
+---
+
+> *Originally published Oct 13, 2023 on the TDS Archive ([Medium](https://medium.com/data-science/why-and-how-to-achieve-longer-context-windows-for-llms-5f76f8656ea9)). Re-posted here with interactive versions of the figures.*
+
+Language models (LLMs) have revolutionized natural language processing over the last few years, reaching state-of-the-art results on a wide range of tasks. One stubborn challenge in developing and improving them is extending the length of their context — it determines how much information is available to the model when generating an output.
+
+Increasing the context window of an LLM isn't so simple, though: it comes at the cost of increased computational complexity, since the attention matrix grows quadratically.
+
+One solution is to train the model on a large amount of data with a relatively small window (e.g. 4K tokens) and then fine-tune it on a bigger one (e.g. 64K tokens). This operation isn't straightforward — even though the context length doesn't impact the number of weights, it does affect how the **positional information** of tokens is encoded by those weights in the tokens' dense representation.
+
+That reduces the model's capacity to adapt to longer contexts even after fine-tuning, resulting in poor performance and requiring new techniques to encode positional information correctly and dynamically between training and fine-tuning.
+
+## Absolute positional encoding
+
+In transformers, the position of each token is encoded before the token is fed to the attention heads. It's a crucial step since transformers, unlike RNNs, don't keep track of token position.
+
+The original transformer architecture [[1]](#references) encodes positions as vectors of the same shape as the tokens' embeddings so that they can be **added** together. In particular, the authors used a combination of cos/sin waves with wavelengths increasing from low to higher-order dimensions of the embedding.
+
+<YarnSinusoidalPe />
+
+<Caption>
+  Sinusoidal positional encoding across dimensions — longer wavelengths in higher dimensions.
+</Caption>
+
+This method gives an efficient, unique dense representation of every position. But it doesn't solve the challenge of extending context length, because these representations can't efficiently encode the *relative* positions of tokens.
+
+To see why, focus on a single pair of consecutive dimensions. Plotting them on a chart, we can represent token and position embeddings as 2D vectors:
+
+<YarnAbsolutePe />
+
+<Caption>
+  Embedding space (left) vs. key/query space (right). Embedding vectors in black, positional vectors in blue, their sum in green.
+</Caption>
+
+On the left we have the embedding space; on the right, the key/query space. Embedding vectors are black, positional vectors are blue, their sum is green.
+
+To shift from embeddings to keys $K$ and queries $Q$, the transformer applies linear transformations defined by the matrices $W_q$ and $W_k$. By linearity, the transformation can be applied separately to embeddings and positional vectors. In KQ-space the attention is computed as the dot product between keys and queries — in the figure, the yellow area between the two green vectors.
+
+The relative distance between tokens is not directly accessible to the model: rotations mix up differently depending on the original orientations of the tokens' and positions' embeddings, and on how they're scaled in the transformations.
+
+It's also worth noting that in this case the addition is applied *before* the transformation and not vice-versa, since positional embeddings have to be scaled by the linear layer.
+
+## Relative positional encoding
+
+To efficiently encode relative position information, other methods have been proposed. We focus on **RoPE** [[2]](#references) — **Ro**tary **P**osition **E**mbedding — for which extensions for longer context windows have been developed.
+
+The two main innovations of RoPE are:
+
+- The dot product between keys and queries becomes sensitive only to the **relative distance** between them.
+- Positional embeddings are **multiplied** by token embeddings, without needing a fixed-size look-up table.
+
+To get there, we map the tokens' embeddings from real $D$-dimensional space to a complex $D/2$-dimensional one and apply the rotation in that space.
+
+Again, consider a single pair of consecutive dimensions. Plotting them on the complex plane (the first on the real axis, the second on the imaginary), we can represent token embeddings as complex vectors:
+
+<YarnRopeRotation />
+
+<Caption>
+  A token embedding as a complex vector — RoPE applies a rotation directly in the complex plane.
+</Caption>
+
+Here positional encodings acquire a new meaning: they become rotations directly applied to the vectors. This change lets them simultaneously encode the position of the token uniquely and be preserved through the linear transformation.
+
+That preservation is fundamental for incorporating relative positions into the computation of attention. If we consider the attentions between the unrotated (black) and rotated (green) versions of $k_n$ and $q_{n+k}$ — represented by the orange and yellow angles in the right chart — something interesting pops out:
+
+<YarnRopeRelative />
+
+<Caption>
+  Attention between rotated keys and queries differs from the unrotated version only by a factor proportional to the difference between their positions.
+</Caption>
+
+The attention between the rotated keys and queries differs from the unrotated version only by a factor proportional to the difference between their positions.
+
+This property lets models trained with RoPE achieve **rapid convergence** and **lower losses**, and it's the hook on which most popular context-extension techniques hang.
+
+Until now we've kept embedding dimensions fixed, but to see the whole framework we also need to look at what happens along that direction.
+
+<YarnRopeSpectrum />
+
+<Caption>
+  Rotation angle across embedding dimensions — as $d$ grows, the rotation applied decreases exponentially.
+</Caption>
+
+The RoPE formula defines the angle of rotation for the $d$-th dimension proportional to $\exp(-d)$, so as $d$ grows, the rotation applied to the embedding vector decreases exponentially (for fixed $n$ and position). This shifts the type of information encoded in the embeddings from low-frequency (close-token associations) to high-frequency (far-token associations) as we move from lower to higher dimensions.
+
+## RoPE extensions
+
+Once we've efficiently incorporated relative position information, the most direct way to increase the context window $L$ is fine-tuning with **position interpolation** (**PI**) [[3]](#references).
+
+PI is a simple technique that scales token positions to fit a new context length. For example, to double the window, divide all positions by two. In general, for any target length $L^* > L$, define a scale factor $s = L / L^* < 1$.
+
+Although PI has shown promising results — successfully extending LLM context with fine-tuning on a relatively small amount of data — it has its drawbacks.
+
+One is that it slightly decreases performance (e.g. perplexity rises) at short context sizes after fine-tuning on larger ones. This happens because scaling positions by $s < 1$ (and therefore also their relative distances) reduces the rotation applied to the vectors, causing a loss of high-frequency information. The model becomes less able to recognize small rotations and therefore less able to figure out the positional order of close-by tokens.
+
+To address this, we can use **NTK-aware** [[4]](#references) positional interpolation: instead of scaling every RoPE dimension equally by $s$, spread the interpolation pressure across dimensions, scaling high frequencies less and low frequencies more.
+
+Other PI extensions exist, such as **NTK-by-parts** [[5]](#references) and **Dynamic NTK** [[6]](#references). The first imposes two thresholds to limit the scaling above and below certain dimensions; the second dynamically adjusts $s$ during inference.
+
+Finally, it was observed that as the number of tokens grows, the attention softmax distribution becomes increasingly "spiky" (the average entropy of the softmax decreases). **YaRN** [[7]](#references) — **Y**et **a**nother **R**oPE extensio**N** method — inverts this process by multiplying the attention matrix by a temperature factor $t$ before applying the softmax.
+
+Here's a look at what these methods do from both position (number of rotations) and dimension (degree per single rotation) perspectives.
+
+<YarnRopeExtensions />
+
+<Caption>
+  Comparison of PI, NTK-aware, NTK-by-parts, and Dynamic NTK across the dimension and position axes. The vertical red line marks the training context $L$; everything to its right is the extrapolation regime.
+</Caption>
+
+### Other methods
+
+A couple of other popular context-extension methods:
+
+- **ALiBi** [[8]](#references): a positional-encoding method that penalizes the attention a query can assign to a key based on how far apart they are.
+- **XPos** [[9]](#references): generalizes RoPE to include a scaling factor.
+
+## References
+
+1. Vaswani et al., 2017. *Attention Is All You Need.* [arxiv.org/abs/1706.03762](https://arxiv.org/abs/1706.03762)
+2. Su et al., 2022. *RoFormer: Enhanced Transformer with Rotary Position Embedding.* [arxiv.org/abs/2104.09864](https://arxiv.org/abs/2104.09864)
+3. Chen et al., 2023. *Extending Context Window of Large Language Models via Positional Interpolation.* [arxiv.org/abs/2306.15595](https://arxiv.org/abs/2306.15595)
+4. bloc97, 2023. *NTK-Aware Scaled RoPE allows LLaMA models to have extended (8k+) context size without any fine-tuning and minimal perplexity degradation.* [Reddit post](https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/)
+5. bloc97, 2023. *Add NTK-Aware interpolation "by parts" correction.* [GitHub PR](https://github.com/jquesnelle/yarn/pull/1)
+6. emozilla, 2023. *Dynamically Scaled RoPE further increases performance of long-context LLaMA with zero fine-tuning.* [Reddit post](https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/)
+7. Peng et al., 2023. *YaRN: Efficient Context Window Extension of Large Language Models.* [arxiv.org/abs/2309.00071](https://arxiv.org/abs/2309.00071)
+8. Press et al., 2022. *Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation.* [OpenReview](https://openreview.net/forum?id=R8sQPpGCv0)
+9. Sun et al., 2022. *A Length-Extrapolatable Transformer.* [arxiv.org/abs/2212.10554](https://arxiv.org/abs/2212.10554)

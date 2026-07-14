@@ -1,0 +1,124 @@
+---
+title: "TriAttention, or: what a rotating query already knows"
+date: "2026-04-22"
+section: "Research"
+description: "KV-cache compression without observing attention — a trigonometric shortcut hiding in the geometry of RoPE."
+---
+
+## The Opening
+
+If you browse online, you'll easily find someone explaining how to load the latest 8B model on your local Mac. If you're lucky enough, you'll get it running, wire it to your coding environment, and start locally vibe-coding your next billion-dollar SaaS. Shortly afterwards, something bad happens: the Mac starts chugging and rapidly asks you to kill apps to free memory. What happened? Didn't they tell you your Mac could handle an 8B model? Were they lying?
+
+While your Mac *can* load the model weights, the problem is that occupied memory also depends heavily on the length of the context you're processing. Coding sessions can easily exceed 100k tokens, which, when fed into your model, results in >20GB of KV cache to load.
+
+KV cache is expensive but fundamental. It carries the context of your conversation: the system prompt, tools, memories, and countless other details. It's effectively the working memory of the model and you definitely don't want to throw it away. At the same time, the KV cache carries a massive amount of redundant information. Recent research has focused on finding clever ways to compress it, keeping just what matters to continue generation.
+
+The problem is how to define *what matters*. This is fundamentally hard because LLMs aren't bag-of-words models. Through successive layers of self-attention, information smears across the sequence. This means we can't just rely on lexical filtering, dropping stop words, or using similar shallow heuristics. You aren't just deleting a word; you might be deleting a critical routing hub. Instead, all the proposed techniques basically ask the same question:
+
+> *Which keys will receive high attention from future queries?*
+
+Keys and related values are the atoms of information in a LLM; when a model generates tokens it uses queries of each token to match the past keys and retrieve relevant values. So, it's reasonable to keep only the keys that will be recalled by future queries.
+
+The obvious answer is to look at recent attention scores to estimate future ones. If a key just got hit hard by the last few queries, it'll probably get hit again, so keep it. If nothing's looked at it in a while, evict it.
+
+This is roughly what H2O, SnapKV, and R-KV all do, with different flavors. H2O tracks which keys have consistently been hit across decoding steps. SnapKV uses a small observation window near the end of the prompt to guess which keys the model will want during generation, and R-KV adds a redundancy filter on top.
+
+Reasonable ideas. Empirically decent. There's just one structural problem.
+
+The assumption these methods rest on — that keys receiving high attention recently will receive high attention soon — is fundamentally flawed. It only holds if past and future queries are geometrically similar, effectively "asking" the keys roughly the same question.
+
+## The Problem
+
+But RoPE, the positional encoding almost every modern LLM uses, rotates every query by an amount that depends on its position. The query at position 1,000 and the query at position 1,050 aren't just different vectors; they're rotated to different orientations, projecting onto the keys from different angles. A key that looked unimportant to recent queries might be exactly what the next query, rotated further still, reaches for.
+
+The practical consequence is harsh. Because each query past a certain distance is rotated too far to be predictive, the number of recent queries whose attention actually tells us something about the next one caps out at around 25. In a 32,000-token context, that's 0.08% of the sequence.
+
+Worse, retrieval-type heads often let important keys go dormant for long stretches before they become critical again; a token that received zero attention during our tiny window might be exactly the one the model needs three thousand tokens from now. When that key gets evicted, the generation breaks, and bad things can happen.
+
+So we have a method that's looking at a sliver of the past, through a rotating lens, trying to predict something that hasn't happened yet. It sort of works, but it's fundamentally guessing. Which raises a strange question:
+
+> *Can we predict which keys will receive attention without observing any attention at all?*
+
+## The Intuition
+
+The question sounds absurd. Attention is a computation over queries and keys — how could you predict its result without running it?
+
+Statistics gives us the answer. We don't need every attention score; we just need to know which keys will *tend* to score high across future queries. Tendencies can be predicted without observation, as long as the underlying process has stable structure. You can't guess tomorrow's stock price without watching the market. You can guess that water will boil at 100°C without running the experiment.
+
+So the real question is whether attention is more like the stock price or the boiling point.
+
+To find out, we need to look at Q and K vectors without RoPE in the way. Remember, RoPE is a rotation, it's applied on top of whatever Q and K already are. The model's weights produce a "raw" Q and K for each token, and then RoPE rotates them by an angle that depends on position.
+
+Strip the rotation away, look at the raw vectors and something remarkable appears. Across thousands of attention heads in modern LLMs, the raw Q vectors cluster tightly around a fixed direction. Measured by a standard concentration statistic called *Mean Resultant Length* ($R = 1$ means all vectors point the same way, $R = 0$ means they're uniformly spread), about 85% of heads in Qwen3-8B have $R$ above 0.95, independent of the context.
+
+<TriattConcentration />
+
+<Caption>
+  Pre-RoPE, both Q and K cluster tightly around their own directions (high $R_Q$, $R_K$); post-RoPE, the position-dependent rotation smears both across the circle.
+</Caption>
+
+The same is true of K vectors. The paper calls this *Q/K concentration*. It's not a property of any particular input or any particular head type — it's a property of the trained model itself.
+
+This is the structure we were looking for. Every future Q vector, in raw form, will point roughly along the same direction for a given head. That means we can predict what future queries will ask of the keys before any query arrives. We don't need to observe attention. We can compute the structure attention is going to have, from the head's weights alone.
+
+## The Solution
+
+The RoPE attention logit — the score that decides how much attention a key receives from a query — has a clean form. For a query at position $p_q$ and a key at position $p_k$, it's a sum over frequency bands:
+
+$$
+\text{logit}(q, k) = \sum_f |q_f| \cdot |k_f| \cdot \cos(\omega_f \Delta + \phi_f)
+$$
+
+where $\Delta = p_q - p_k$ is the distance between query and key, $\omega_f$ are the RoPE frequencies (fixed, geometric progression), and $\phi_f$ is the phase difference between this specific $q_f$ and $k_f$. The formula says:
+
+> Attention is a sum of cosines, one per frequency band, each weighted by the magnitudes of the query and key in that band.
+
+Normally, every term in this sum depends on *which* query and *which* key we're looking at. Magnitudes vary, phases vary, and the logit is genuinely a function of the specific q and k.
+
+But we just established that $q_f$ and $k_f$ aren't varying much. For a concentrated head, every query is approximately $\bar{q}_f$ and every key is approximately $\bar{k}_f$ — their centers. Substitute the centers into the formula, and watch what happens to the dependencies:
+
+$$
+\text{logit}(\Delta) \approx \sum_f |\bar{q}_f| \cdot |\bar{k}_f| \cdot \cos(\omega_f \Delta + \bar{\phi}_f)
+$$
+
+The magnitudes $\|\bar{q}_f\|$ and $\|\bar{k}_f\|$ are now constants — they're properties of the head, computed once. The phase $\bar{\phi}_f$ is a constant, the angle between the two centers. The RoPE frequencies $\omega_f$ were always constants. The only thing still varying is $\Delta$.
+
+That's the whole derivation. The attention logit is now a function of distance alone.
+
+This function is a **trigonometric series**. A sum of cosines at fixed frequencies, with fixed coefficients, evaluated at a single variable. It produces a curve over distance, with peaks at some distances, troughs at others, shape determined entirely by the head's centers.
+
+Every attention head, once trained, carries its own such curve. Different heads have different curves: some peak near $\Delta = 0$ (local attention), some peak far out (attention sinks), some have multiple humps. But the curve is always there, and it's always a property of the head, not of any particular query or key.
+
+<TriattCurve />
+
+<Caption>
+  Drag the centers on the disk; the logit curve on the right is the trigonometric series their relative angle and magnitudes trace out over distance.
+</Caption>
+
+## The Method
+
+This is what concentration buys us. Not a rough heuristic, not a statistical tendency — an actual function, computable from the head's weights, that tells us how much attention any key will receive based on nothing but its distance to the query.
+
+The method, TriAttention, writes itself: for each cached key, compute its distance $\Delta$ to the current query. Read off the value of the head's curve at that distance. That's the key's score. Sort. Keep the top-B. Drop the rest.
+
+No observation window. No rotating queries. No extrapolation from past attention to future attention. The curve *is* the future attention, or as close to it as concentration allows, and it was computable from the model's weights before we saw a single token.
+
+<TriattScoring />
+
+<Caption>
+  Each cached key gets scored by reading off the head's curve at its distance to the current query; the top-B survive and the rest are evicted.
+</Caption>
+
+The curve itself comes from a small offline calibration step. Run a handful of examples through the model, collect Q vectors in pre-RoPE space, average them to get $\mathbb{E}[q_f]$ for each frequency band. The paper finds this calibration is remarkably insensitive to what data you use.
+
+Two refinements make the method complete. First, for the ~15% of heads with weaker concentration, the curve alone isn't enough, so TriAttention adds a second term, $S_{\text{norm}}$, that scores keys by their own vector magnitudes and contributes proportionally to $(1 - R_f)$. On tightly concentrated heads it's near zero. On loosely concentrated heads it takes over. The method picks its own weighting.
+
+Second, a given key won't just be queried once — it'll be queried again at $\Delta+1, \Delta+2$, and so on. So the score is averaged over multiple future offsets, not evaluated at a single distance. A good key has to be valuable across its whole future trajectory, not just the next token.
+
+## The End
+
+There is a profound geometrical beauty to this approach. TriAttention doesn't fight the architecture with complex heuristics; it exploits the latent structure the model naturally converges on. By pulling back the veil of RoPE, it transforms KV cache eviction from a messy, reactive guessing game into a clean, deterministic evaluation of spatial relationships.
+
+The empirical payoff for this mathematical elegance is evident. On AIME25, Qwen3-8B with TriAttention matches full-attention accuracy while operating on less than a tenth of the KV memory budget. The model retains its complex reasoning capacity, but that crushing >20GB memory footprint simply collapses.
+
+But beyond the immediate engineering win of running massive contexts on consumer hardware, there's a critical broader lesson here. As a field, we often default to treating LLMs as inscrutable black boxes, throwing raw compute or hacky patches at our bottlenecks. TriAttention is a sharp reminder of what happens when we actually dissect the mechanics. When we bother to investigate the literal shapes, symmetries, and mathematical realities of the representations these models learn, we find elegant, native solutions hiding in plain sight. To push the frontier forward, we don't just need better hardware to brute-force our way through the math; we need a much deeper, more rigorous understanding of the models we've already built.
